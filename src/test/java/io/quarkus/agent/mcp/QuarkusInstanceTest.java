@@ -187,6 +187,57 @@ class QuarkusInstanceTest {
     }
 
     @Test
+    void ignoresListeningOnFromOneShotTestRunner() throws Exception {
+        // The dev app starts on 8080. A one-shot test run (devui-testing_runTests)
+        // then boots the test application on the test port and logs a start banner
+        // that is identical apart from the thread name JBoss logging prefixes it
+        // with -- that must not clobber the tracked dev port.
+        process = new ProcessBuilder("bash", "-c",
+                "echo '2026-09-09 17:00:00,000 INFO  [io.quarkus] (main) my-app 1.0.0-SNAPSHOT on JVM (powered by Quarkus 3.39.1) started in 1.0s. Listening on: http://localhost:8080' "
+                        + "&& echo '2026-09-09 17:00:05,000 INFO  [io.quarkus] (oneshot-test-runner) my-app 1.0.0-SNAPSHOT on JVM (powered by Quarkus 3.39.1) started in 0.5s. Listening on: http://localhost:8081' "
+                        + "&& sleep 5")
+                .start();
+        QuarkusInstance instance = new QuarkusInstance("/test/project", "maven", null, null, null, process, executor);
+
+        Thread.sleep(500);
+
+        assertEquals(8080, instance.getHttpPort());
+    }
+
+    @Test
+    void ignoresListeningOnFromContinuousTestRunner() throws Exception {
+        // Continuous testing runs on its own thread ("Test runner thread") rather
+        // than the one-shot pool, and boots the same test application.
+        process = new ProcessBuilder("bash", "-c",
+                "echo '2026-09-09 17:00:00,000 INFO  [io.quarkus] (main) my-app 1.0.0-SNAPSHOT on JVM (powered by Quarkus 3.39.1) started in 1.0s. Listening on: http://localhost:8080' "
+                        + "&& echo '2026-09-09 17:00:05,000 INFO  [io.quarkus] (Test runner thread) my-app 1.0.0-SNAPSHOT on JVM (powered by Quarkus 3.39.1) started in 0.5s. Listening on: http://localhost:8081' "
+                        + "&& sleep 5")
+                .start();
+        QuarkusInstance instance = new QuarkusInstance("/test/project", "maven", null, null, null, process, executor);
+
+        Thread.sleep(500);
+
+        assertEquals(8080, instance.getHttpPort());
+    }
+
+    @Test
+    void testRunnerBannerDoesNotMarkInstanceStarted() throws Exception {
+        // A test run can overlap a restart, which puts the instance back into
+        // STARTING. The test application's banner must not be taken as the dev
+        // server having finished starting up.
+        process = new ProcessBuilder("bash", "-c",
+                "echo '2026-09-09 17:00:05,000 INFO  [io.quarkus] (oneshot-test-runner) my-app 1.0.0-SNAPSHOT on JVM (powered by Quarkus 3.39.1) started in 0.5s. Listening on: http://localhost:8081' "
+                        + "&& sleep 5")
+                .start();
+        QuarkusInstance instance = new QuarkusInstance("/test/project", "maven", null, null, null, process, executor);
+
+        Thread.sleep(500);
+
+        assertEquals(QuarkusInstance.Status.STARTING, instance.getStatus());
+        assertEquals(-1, instance.getHttpPort());
+    }
+
+    @Test
     void detectsDevMcpPathFromLog() throws Exception {
         process = new ProcessBuilder("bash", "-c",
                 "echo 'Listening on: http://localhost:8080' && echo 'Dev MCP available at: /custom/dev-mcp' && sleep 5")
