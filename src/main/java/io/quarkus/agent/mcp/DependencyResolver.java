@@ -196,6 +196,9 @@ public final class DependencyResolver {
 
     private static List<Dependency> resolveViaMaven(File dir) {
         String mvnCmd = ProcessUtils.resolveMavenCommand(dir);
+        LOG.infof("Resolving dependencies via '%s dependency:list' in %s (this can take up to 180s)...",
+                mvnCmd, dir);
+        long start = System.currentTimeMillis();
         try {
             Path tempFile = Files.createTempFile("mvn-deps-", ".txt");
             try {
@@ -209,11 +212,13 @@ public final class DependencyResolver {
                 try {
                     if (!process.waitFor(180, TimeUnit.SECONDS)) {
                         process.destroyForcibly();
-                        LOG.debugf("Maven dependency:list timed out for %s", dir);
+                        LOG.warnf("Maven dependency:list timed out after %d ms for %s",
+                                System.currentTimeMillis() - start, dir);
                         return null;
                     }
                     if (process.exitValue() != 0) {
-                        LOG.debugf("Maven dependency:list exited with code %d for %s", process.exitValue(), dir);
+                        LOG.warnf("Maven dependency:list exited with code %d after %d ms for %s",
+                                process.exitValue(), System.currentTimeMillis() - start, dir);
                         return null;
                     }
                 } catch (InterruptedException e) {
@@ -222,12 +227,16 @@ public final class DependencyResolver {
                     return null;
                 }
                 String output = Files.readString(tempFile);
-                return parseMavenDependencyList(output);
+                List<Dependency> deps = parseMavenDependencyList(output);
+                LOG.infof("Maven dependency:list resolved %d dependencies in %d ms for %s",
+                        deps.size(), System.currentTimeMillis() - start, dir);
+                return deps;
             } finally {
                 Files.deleteIfExists(tempFile);
             }
         } catch (IOException e) {
-            LOG.debugf("Failed Maven dependency resolution for %s: %s", dir, e.getMessage());
+            LOG.warnf("Failed Maven dependency resolution for %s after %d ms: %s",
+                    dir, System.currentTimeMillis() - start, e.getMessage());
             return null;
         }
     }

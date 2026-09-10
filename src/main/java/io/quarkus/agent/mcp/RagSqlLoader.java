@@ -93,6 +93,7 @@ public class RagSqlLoader {
             String host, int port, String database, String user, String password) {
         String versionKey = quarkusVersion != null ? quarkusVersion : "default";
         String jdbcUrl = "jdbc:postgresql://" + host + ":" + port + "/" + database;
+        LOG.infof("RAG ensureLoaded: starting for version=%s, projectDir=%s", versionKey, projectDir);
 
         ensureSchema(jdbcUrl, user, password);
 
@@ -102,7 +103,10 @@ public class RagSqlLoader {
             return;
         }
 
+        long discoverStart = System.currentTimeMillis();
         List<RagFragment> allFragments = discoverSqlFragments(resolvedVersion, projectDir);
+        LOG.infof("RAG ensureLoaded: discovered %d fragment(s) for %s in %d ms", allFragments.size(),
+                resolvedVersion, System.currentTimeMillis() - discoverStart);
         if (allFragments.isEmpty()) {
             LOG.infof("No RAG SQL fragments found for Quarkus %s", resolvedVersion);
             return;
@@ -173,21 +177,39 @@ public class RagSqlLoader {
         return fragments;
     }
 
+    // Hard budget for the whole non-core extension RAG scan. Individual network/process
+    // fallbacks (HTTP download, `mvn dependency:get`) each carry their own timeout, but on
+    // projects with many dependencies those can add up to a very long stall with no visible
+    // progress. Once the budget is exceeded we stop attempting *new* network/process lookups
+    // and finish the pass using only what's already available locally, so callers get a
+    // (possibly partial) result in bounded time instead of hanging indefinitely.
+    private static final long NON_CORE_SCAN_BUDGET_MILLIS = Long.getLong(
+            "agent-mcp.doc-search.non-core-scan-budget-millis", 120_000L);
+
     private List<RagFragment> scanNonCoreExtensionJars(Path m2Repo, String projectDir, String quarkusVersion) {
         if (projectDir == null) {
             return List.of();
         }
 
+        long scanStart = System.currentTimeMillis();
         List<DependencyResolver.Dependency> deps = DependencyResolver.resolve(projectDir);
+        LOG.infof("RAG scan: resolved %d dependencies for %s in %d ms", deps.size(), projectDir,
+                System.currentTimeMillis() - scanStart);
         if (deps.isEmpty()) {
             return List.of();
         }
 
         List<RagFragment> fragments = new ArrayList<>();
+        int index = 0;
+        int skippedDueToBudget = 0;
         for (DependencyResolver.Dependency dep : deps) {
+            index++;
             if (CORE_GROUP_ID.equals(dep.groupId())) {
                 continue;
             }
+            long elapsedSoFar = System.currentTimeMillis() - scanStart;
+            boolean budgetExceeded = elapsedSoFar > NON_CORE_SCAN_BUDGET_MILLIS;
+
             String groupPath = dep.groupId().replace('.', '/');
             Path deploymentJar = m2Repo.resolve(groupPath)
                     .resolve(dep.artifactId() + DEPLOYMENT_SUFFIX)
@@ -195,21 +217,43 @@ public class RagSqlLoader {
                     .resolve(dep.artifactId() + DEPLOYMENT_SUFFIX + "-" + dep.version() + ".jar");
 
             if (!Files.isRegularFile(deploymentJar)) {
+                LOG.debugf("RAG scan [%d/%d] %s:%s — no deployment jar at %s, skipping",
+                        index, deps.size(), dep.groupId(), dep.artifactId(), deploymentJar);
                 continue;
             }
 
             // Check for a pointer to a separate RAG artifact
             RagArtifactPointer pointer = readRagArtifactPointer(deploymentJar);
             if (pointer != null) {
+                if (budgetExceeded) {
+                    skippedDueToBudget++;
+                    LOG.warnf(
+                            "RAG scan [%d/%d] %s:%s — skipping remote RAG artifact lookup (%s:%s), "
+                                    + "%d ms scan budget exceeded (elapsed %d ms)",
+                            index, deps.size(), dep.groupId(), dep.artifactId(),
+                            pointer.groupId(), pointer.artifactId(), NON_CORE_SCAN_BUDGET_MILLIS, elapsedSoFar);
+                    continue;
+                }
+                long depStart = System.currentTimeMillis();
+                LOG.infof("RAG scan [%d/%d] %s:%s — resolving external RAG artifact %s:%s:%s...",
+                        index, deps.size(), dep.groupId(), dep.artifactId(),
+                        pointer.groupId(), pointer.artifactId(), dep.version());
                 RagFragment fragment = resolveExternalRagArtifact(
                         pointer, dep.version(), m2Repo, projectDir);
+                long depElapsed = System.currentTimeMillis() - depStart;
                 if (fragment != null) {
                     String guideUrl = readGuideUrl(m2Repo, dep);
                     fragments.add(injectExtensionMetadata(fragment, dep.artifactId(), quarkusVersion, guideUrl));
-                    LOG.debugf("Found RAG SQL via external artifact %s:%s:%s",
-                            pointer.groupId(), pointer.artifactId(), dep.version());
+                    LOG.infof("RAG scan [%d/%d] %s:%s — found RAG SQL via external artifact %s:%s:%s (%d ms)",
+                            index, deps.size(), dep.groupId(), dep.artifactId(),
+                            pointer.groupId(), pointer.artifactId(), dep.version(), depElapsed);
                     continue;
                 }
+                LOG.infof(
+                        "RAG scan [%d/%d] %s:%s — external RAG artifact %s:%s:%s unavailable (%d ms), "
+                                + "falling back to deployment jar contents",
+                        index, deps.size(), dep.groupId(), dep.artifactId(),
+                        pointer.groupId(), pointer.artifactId(), dep.version(), depElapsed);
             }
 
             // Fallback: read RAG SQL directly from the deployment JAR
@@ -220,6 +264,9 @@ public class RagSqlLoader {
                 LOG.debugf("Found RAG SQL in non-core extension %s", dep.artifactId());
             }
         }
+        long totalElapsed = System.currentTimeMillis() - scanStart;
+        LOG.infof("RAG scan: finished %d dependencies in %d ms (%d fragment(s) found, %d skipped due to budget)",
+                deps.size(), totalElapsed, fragments.size(), skippedDueToBudget);
         return fragments;
     }
 
@@ -291,7 +338,8 @@ public class RagSqlLoader {
         }
         String mvnCmd = ProcessUtils.resolveMavenCommand(dir);
         String artifact = pointer.groupId() + ":" + pointer.artifactId() + ":" + version;
-        LOG.infof("RAG artifact not found locally, fetching %s via Maven...", artifact);
+        LOG.infof("RAG artifact not found locally, fetching %s via Maven (cmd=%s, dir=%s)...",
+                artifact, mvnCmd, dir);
 
         ProcessBuilder pb = new ProcessBuilder(
                 mvnCmd, "dependency:get",
@@ -301,30 +349,36 @@ public class RagSqlLoader {
                 .directory(dir)
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                 .redirectError(ProcessBuilder.Redirect.DISCARD);
+        long start = System.currentTimeMillis();
         try {
             Process process = pb.start();
             try {
                 if (!process.waitFor(120, TimeUnit.SECONDS)) {
                     process.destroyForcibly();
-                    LOG.warnf("Maven dependency:get timed out for %s — documentation search may be limited", artifact);
+                    LOG.warnf("Maven dependency:get timed out after %d ms for %s — documentation search may be limited",
+                            System.currentTimeMillis() - start, artifact);
                     return false;
                 }
+                long elapsed = System.currentTimeMillis() - start;
                 if (process.exitValue() == 0) {
-                    LOG.infof("Successfully fetched RAG artifact %s via Maven", artifact);
+                    LOG.infof("Successfully fetched RAG artifact %s via Maven (%d ms)", artifact, elapsed);
                     return true;
                 }
-                LOG.warnf("Maven dependency:get failed for %s (exit code %d) — RAG data for this extension will be unavailable",
-                        artifact, process.exitValue());
+                LOG.warnf(
+                        "Maven dependency:get failed for %s (exit code %d, %d ms) — RAG data for this extension will be unavailable",
+                        artifact, process.exitValue(), elapsed);
                 return false;
             } finally {
                 process.destroyForcibly();
             }
         } catch (IOException e) {
-            LOG.warnf("Failed to start Maven for dependency:get (%s): %s", artifact, e.getMessage());
+            LOG.warnf("Failed to start Maven for dependency:get (%s) after %d ms: %s",
+                    artifact, System.currentTimeMillis() - start, e.getMessage());
             return false;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            LOG.debugf("Maven dependency:get interrupted for %s", artifact);
+            LOG.debugf("Maven dependency:get interrupted for %s after %d ms",
+                    artifact, System.currentTimeMillis() - start);
             return false;
         }
     }
@@ -429,25 +483,28 @@ public class RagSqlLoader {
 
         LOG.infof("RAG SQL not found locally, downloading from %s...", url);
 
+        long start = System.currentTimeMillis();
         try {
             var request = webClient.getAbs(url).timeout(60_000);
             SkillReader.addAuthHeader(request, repoInfo, projectDir);
 
             var response = request.send().await().atMost(Duration.ofSeconds(65));
+            long elapsed = System.currentTimeMillis() - start;
 
             if (response.statusCode() == 200) {
                 Files.createDirectories(targetPath.getParent());
                 Files.write(targetPath, response.body().getBytes(),
                         StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                LOG.infof("Downloaded RAG SQL artifact to %s", targetPath);
+                LOG.infof("Downloaded RAG SQL artifact to %s (%d ms)", targetPath, elapsed);
                 return targetPath;
             } else {
-                LOG.warnf("RAG SQL artifact not available at %s (HTTP %d) — documentation search will be limited",
-                        url, response.statusCode());
+                LOG.warnf("RAG SQL artifact not available at %s (HTTP %d, %d ms) — documentation search will be limited",
+                        url, response.statusCode(), elapsed);
                 return null;
             }
         } catch (IOException | RuntimeException e) {
-            LOG.warnf("Failed to download RAG SQL from %s: %s", url, e.getMessage());
+            long elapsed = System.currentTimeMillis() - start;
+            LOG.warnf("Failed to download RAG SQL from %s after %d ms: %s", url, elapsed, e.getMessage());
             return null;
         }
     }

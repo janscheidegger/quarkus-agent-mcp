@@ -53,6 +53,9 @@ public class ContainerManager {
     @Inject
     RagSqlLoader ragSqlLoader;
 
+    @ConfigProperty(name = "agent-mcp.doc-search.warmup-timeout-millis", defaultValue = "300000")
+    long warmupTimeoutMillis;
+
     private final ConcurrentHashMap<String, GenericContainer<?>> containers = new ConcurrentHashMap<>();
     private final Set<String> fallbackVersions = ConcurrentHashMap.newKeySet();
     private final Set<String> ragSqlVersions = ConcurrentHashMap.newKeySet();
@@ -64,20 +67,56 @@ public class ContainerManager {
     /**
      * Starts the default container in a background thread so the first searchDocs
      * call doesn't block for container startup.
+     * <p>
+     * A watchdog thread interrupts the warm-up after {@code warmupTimeoutMillis} (default 5
+     * minutes) if it hasn't finished, so callers get a clear failure instead of "still warming
+     * up" forever when a slow/unreachable dependency lookup (e.g. Maven artifact resolution over
+     * a restricted network) blocks the pipeline. Check the agent-mcp log for per-step timing —
+     * look for "RAG scan" and "Maven dependency" entries to see exactly which lookup was stuck.
      */
     public void warmUpDefaultAsync() {
         if (defaultWarmupStarted) {
             return;
         }
         defaultWarmupStarted = true;
-        Thread.ofVirtual().name("container-warmup").start(() -> {
+        long warmupStart = System.currentTimeMillis();
+        Thread worker = Thread.ofVirtual().name("container-warmup").unstarted(() -> {
             try {
                 ensureRunning(null, null);
                 defaultWarmupDone = true;
-                LOG.info("Documentation search is ready");
-            } catch (Exception e) {
-                LOG.warn("Background container warm-up failed: " + e.getMessage());
-                defaultWarmupError = e.getMessage();
+                LOG.infof("Documentation search is ready (%d ms)", System.currentTimeMillis() - warmupStart);
+            } catch (Throwable e) {
+                // Catch Throwable, not just Exception: an uncaught Error (e.g. NoClassDefFoundError,
+                // ExceptionInInitializerError) would otherwise kill this thread silently without ever
+                // setting defaultWarmupDone, leaving isReady()/isFailed() both false forever and
+                // searchDocs stuck reporting "still warming up" indefinitely with no diagnostic trace.
+                LOG.error("Background container warm-up failed after "
+                        + (System.currentTimeMillis() - warmupStart) + " ms", e);
+                defaultWarmupError = e.getClass().getSimpleName() + ": " + e.getMessage();
+                defaultWarmupDone = true;
+            }
+        });
+        worker.start();
+
+        Thread.ofPlatform().daemon(true).name("container-warmup-watchdog").start(() -> {
+            try {
+                worker.join(warmupTimeoutMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (!defaultWarmupDone) {
+                long elapsed = System.currentTimeMillis() - warmupStart;
+                LOG.warnf(
+                        "Documentation search warm-up exceeded %d ms (elapsed %d ms) — aborting. "
+                                + "Check the agent-mcp log for 'RAG scan' / 'Maven dependency' entries above "
+                                + "to see which lookup was stuck (often a slow/blocked network call to resolve "
+                                + "a documentation artifact for a project dependency).",
+                        warmupTimeoutMillis, elapsed);
+                worker.interrupt();
+                defaultWarmupError = "Warm-up timed out after " + elapsed + " ms. "
+                        + "See the agent-mcp log for the last 'RAG scan' or 'Maven dependency' entry to "
+                        + "identify which dependency lookup was stuck.";
                 defaultWarmupDone = true;
             }
         });
@@ -331,10 +370,14 @@ public class ContainerManager {
 
     private void loadRagData(String versionKey, String quarkusVersion, String projectDir) {
         GenericContainer<?> container = containers.get(versionKey);
+        LOG.infof("Loading RAG data for Quarkus %s (project=%s)...", versionKey, projectDir);
+        long start = System.currentTimeMillis();
         ragSqlLoader.ensureLoaded(
                 quarkusVersion, projectDir,
                 container.getHost(), container.getMappedPort(5432),
                 pgDatabase, pgUser, pgPassword);
+        LOG.infof("Finished loading RAG data for Quarkus %s in %d ms", versionKey,
+                System.currentTimeMillis() - start);
     }
 
     private void loadNonCoreRagData(String versionKey, String quarkusVersion, String projectDir) {
