@@ -14,14 +14,19 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.HashMap;
+import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -40,7 +45,10 @@ import org.jboss.logging.Logger;
  * in the local Maven repository and loads them into a pgvector database.
  * <p>
  * Supports incremental loading: when new extensions are added to a project,
- * only the new extension's SQL is loaded without reloading existing data.
+ * only the new extension's SQL is loaded without reloading existing data. Each
+ * loaded source is fingerprinted in {@code rag_sources}, so a fragment regenerated
+ * upstream — an extension re-released with better embeddings, say — is reloaded
+ * instead of being skipped as already present.
  * Non-core extensions (Quarkiverse, third-party) are discovered by parsing
  * the project's {@code pom.xml}, following the same pattern as {@link SkillReader}.
  */
@@ -69,6 +77,7 @@ public class RagSqlLoader {
     private static final String DEPLOYMENT_SUFFIX = "-deployment";
     private static final String CORE_GROUP_ID = "io.quarkus";
     private static final String RAG_DOCUMENTS_TABLE = "rag_documents";
+    private static final String RAG_SOURCES_TABLE = "rag_sources";
 
     private static final String CREATE_EXTENSION_DDL = "CREATE EXTENSION IF NOT EXISTS vector";
     private static final String CREATE_TABLE_DDL = """
@@ -81,13 +90,31 @@ public class RagSqlLoader {
     private static final String CREATE_INDEX_DDL = """
             CREATE INDEX IF NOT EXISTS idx_rag_embedding ON rag_documents
                 USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)""";
+    /**
+     * Records which fragment content is currently loaded for each source, so a source
+     * whose fragment has been regenerated upstream is reloaded rather than skipped.
+     */
+    private static final String CREATE_SOURCES_DDL = """
+            CREATE TABLE IF NOT EXISTS rag_sources (
+                source TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                loaded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )""";
 
     private static final String AGGREGATED_ARTIFACT_ID = "quarkus-documentation-core-rag";
     private static final String AGGREGATED_GROUP_PATH = "io/quarkus";
 
     private static final Pattern SOURCE_PATTERN = Pattern.compile(
             "metadata\\s*->>\\s*'source'\\s*=\\s*'([^']+)'");
-    private static final Pattern ROW_SOURCE_PATTERN = Pattern.compile("\"source\"\\s*:\\s*\"([^\"]+)\"");
+    /**
+     * A row's source: {@code source} must be the metadata object's first key, as the generator
+     * emits it and as {@link #EXTENSION_FROM_SOURCE_PATTERN} already assumes. Matching a bare
+     * {@code "source": "..."} anywhere would also hit JSON quoted inside a guide's own text -
+     * the core docs artifact contains a platform-descriptor example that does exactly that -
+     * and every source matched here is one a reload deletes rows for first, so a phantom that
+     * ever collided with a real extension's source would silently wipe that extension's rows.
+     */
+    private static final Pattern ROW_SOURCE_PATTERN = Pattern.compile("\\{\"source\"\\s*:\\s*\"([^\"]+)\"");
     private static final Pattern EXTENSION_FROM_SOURCE_PATTERN = Pattern.compile(
             "'\\{\"source\":\"([^\"]+)\"");
     private static final String VERSION_KEY = ",\"version\":";
@@ -108,12 +135,19 @@ public class RagSqlLoader {
     record RagArtifactPointer(String groupId, String artifactId) {
     }
 
-    private final Map<String, Set<String>> loadedSources = new ConcurrentHashMap<>();
+    /** The jar's RAG SQL entry under either of the two names used, or null if it has neither. */
+    private static JarEntry ragSqlEntry(JarFile jar) {
+        JarEntry entry = jar.getJarEntry(RAG_DATA_SQL_PATH);
+        return entry != null ? entry : jar.getJarEntry(RAG_SQL_PATH);
+    }
+
+    /** versionKey -&gt; (source -&gt; fingerprint of the fragment currently loaded for it). */
+    private final Map<String, Map<String, String>> loadedFingerprints = new ConcurrentHashMap<>();
 
     /**
      * Ensures RAG data is loaded for the given Quarkus version.
-     * Discovers SQL fragments from core and non-core extension JARs,
-     * filters out already-loaded sources, and loads only new data.
+     * Discovers SQL fragments from core and non-core extension JARs, and loads
+     * those that are new or whose content has changed since they were last loaded.
      * On first call for a version with a reused container, seeds tracking
      * from the database to avoid redundant loading.
      */
@@ -140,28 +174,146 @@ public class RagSqlLoader {
             return;
         }
 
-        Set<String> alreadyLoaded = loadedSources.computeIfAbsent(versionKey,
-                k -> ConcurrentHashMap.newKeySet());
+        Map<String, String> loaded = loadedFingerprints.computeIfAbsent(versionKey,
+                k -> new ConcurrentHashMap<>());
 
         // On first call for this version, seed from the database (handles container reuse)
-        if (alreadyLoaded.isEmpty()) {
-            Set<String> existingSources = queryExistingSources(jdbcUrl, user, password);
-            alreadyLoaded.addAll(existingSources);
+        if (loaded.isEmpty()) {
+            loaded.putAll(queryLoadedFingerprints(jdbcUrl, user, password));
         }
 
-        List<RagFragment> newFragments = allFragments.stream()
-                .filter(f -> !alreadyLoaded.contains(f.source()))
-                .toList();
+        List<StaleFragment> staleFragments = new ArrayList<>();
+        for (RagFragment fragment : allFragments) {
+            String fingerprint = fingerprint(resolvedVersion, fragment);
+            if (fingerprint != null && !fingerprint.equals(loaded.get(fragment.source()))) {
+                staleFragments.add(new StaleFragment(fragment, fingerprint));
+            }
+        }
 
-        if (newFragments.isEmpty()) {
-            LOG.debugf("All %d RAG source(s) already loaded for %s", allFragments.size(), versionKey);
+        if (staleFragments.isEmpty()) {
+            LOG.debugf("All %d RAG source(s) already loaded and up to date for %s",
+                    allFragments.size(), versionKey);
             return;
         }
 
-        loadSql(jdbcUrl, user, password, newFragments, resolvedVersion);
+        if (loadSql(jdbcUrl, user, password, staleFragments, resolvedVersion)) {
+            for (StaleFragment stale : staleFragments) {
+                loaded.put(stale.fragment().source(), stale.fingerprint());
+            }
+        }
+    }
 
-        for (RagFragment f : newFragments) {
-            alreadyLoaded.add(f.source());
+    /** A fragment that needs (re)loading, and the fingerprint to record once it is loaded. */
+    record StaleFragment(RagFragment fragment, String fingerprint) {
+    }
+
+    /**
+     * Identifies the content currently loaded for a fragment, so one regenerated upstream is
+     * reloaded rather than skipped. The Quarkus version is part of it because that is injected
+     * into row metadata at load time: the same fragment under a different version really is
+     * different content in the database.
+     * <p>
+     * A streamed fragment is fingerprinted from its jar entry's size and CRC-32, which the zip
+     * central directory already carries, rather than by reading it. This runs on every start,
+     * and the aggregated core artifact is tens of MB, so hashing the content would mean
+     * decompressing all of it just to conclude that nothing has changed.
+     *
+     * @return null if a streamed fragment's jar could not be read, in which case it is left
+     *         alone rather than reloaded on a guess
+     */
+    private String fingerprint(String quarkusVersion, RagFragment fragment) {
+        if (fragment.streamJarPath() == null) {
+            return fingerprint(quarkusVersion, fragment.sql());
+        }
+        try (JarFile jar = new JarFile(fragment.streamJarPath().toFile())) {
+            JarEntry entry = ragSqlEntry(jar);
+            if (entry == null || entry.getSize() < 0 || entry.getCrc() < 0) {
+                return null;
+            }
+            return fingerprint(quarkusVersion, entry.getSize() + ":" + entry.getCrc());
+        } catch (IOException e) {
+            LOG.warnf("Failed to fingerprint streamed RAG fragment %s: %s",
+                    fragment.streamJarPath(), e.getMessage());
+            return null;
+        }
+    }
+
+    static String fingerprint(String quarkusVersion, String content) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            digest.update(quarkusVersion.getBytes(StandardCharsets.UTF_8));
+            digest.update((byte) '\n');
+            digest.update(content.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is required but unavailable", e);
+        }
+    }
+
+    /**
+     * Every source a fragment writes rows for, which is what a reload has to clear first.
+     * A streamed fragment is read line by line rather than materialized, so the aggregated
+     * core artifact never becomes a String; that read only happens when it is actually being
+     * reloaded, alongside the far more expensive execution of its statements.
+     */
+    private Set<String> fragmentSources(RagFragment fragment) throws SQLException {
+        if (fragment.streamJarPath() == null) {
+            return extractSources(fragment.sql(), fragment.source());
+        }
+        try (JarFile jar = new JarFile(fragment.streamJarPath().toFile())) {
+            JarEntry entry = ragSqlEntry(jar);
+            if (entry == null) {
+                return Set.of();
+            }
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(jar.getInputStream(entry), StandardCharsets.UTF_8), 1 << 16)) {
+                return streamSources(reader, fragment.source());
+            }
+        } catch (IOException e) {
+            throw new SQLException("Failed to read sources from " + fragment.streamJarPath(), e);
+        }
+    }
+
+    /** Streaming equivalent of {@link #extractSources}. */
+    static Set<String> streamSources(BufferedReader reader, String fallbackSource) throws IOException {
+        Set<String> sources = new LinkedHashSet<>();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            collectSources(line, sources);
+        }
+        if (sources.isEmpty() && fallbackSource != null) {
+            sources.add(fallbackSource);
+        }
+        return sources;
+    }
+
+    /**
+     * Returns every {@code source} the fragment writes rows for. An aggregated fragment
+     * such as the core docs artifact carries hundreds, and its own DELETE statement only
+     * covers the name it was generated under, so reloading it needs the full set.
+     */
+    static Set<String> extractSources(String sql, String fallbackSource) {
+        Set<String> sources = new LinkedHashSet<>();
+        collectSources(sql, sources);
+        if (sources.isEmpty() && fallbackSource != null) {
+            sources.add(fallbackSource);
+        }
+        return sources;
+    }
+
+    /**
+     * Adds every source named in a chunk of SQL to {@code sources}. Shared with the streaming
+     * scan, which calls it a line at a time: neither pattern can match across a line break, so
+     * the two arrive at the same set.
+     */
+    private static void collectSources(CharSequence sql, Set<String> sources) {
+        Matcher rowMatcher = ROW_SOURCE_PATTERN.matcher(sql);
+        while (rowMatcher.find()) {
+            sources.add(rowMatcher.group(1));
+        }
+        Matcher deleteMatcher = SOURCE_PATTERN.matcher(sql);
+        while (deleteMatcher.find()) {
+            sources.add(deleteMatcher.group(1));
         }
     }
 
@@ -609,10 +761,7 @@ public class RagSqlLoader {
             return null;
         }
         try (JarFile jar = new JarFile(jarPath.toFile())) {
-            JarEntry entry = jar.getJarEntry(RAG_DATA_SQL_PATH);
-            if (entry == null) {
-                entry = jar.getJarEntry(RAG_SQL_PATH);
-            }
+            JarEntry entry = ragSqlEntry(jar);
             if (entry == null) {
                 return null;
             }
@@ -652,10 +801,7 @@ public class RagSqlLoader {
             return null;
         }
         try (JarFile jar = new JarFile(jarPath.toFile())) {
-            JarEntry entry = jar.getJarEntry(RAG_DATA_SQL_PATH);
-            if (entry == null) {
-                entry = jar.getJarEntry(RAG_SQL_PATH);
-            }
+            JarEntry entry = ragSqlEntry(jar);
             if (entry == null) {
                 return null;
             }
@@ -716,10 +862,7 @@ public class RagSqlLoader {
         Path jarPath = fragment.streamJarPath();
         long[] count = { 0 };
         try (JarFile jar = new JarFile(jarPath.toFile())) {
-            JarEntry entry = jar.getJarEntry(RAG_DATA_SQL_PATH);
-            if (entry == null) {
-                entry = jar.getJarEntry(RAG_SQL_PATH);
-            }
+            JarEntry entry = ragSqlEntry(jar);
             if (entry == null) {
                 LOG.warnf("RAG SQL entry not found for streamed fragment %s", fragment.source());
                 return 0;
@@ -837,67 +980,90 @@ public class RagSqlLoader {
     private void ensureSchema(String jdbcUrl, String user, String password) {
         try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password);
                 Statement stmt = conn.createStatement()) {
-            stmt.execute(CREATE_EXTENSION_DDL);
-            stmt.execute(CREATE_TABLE_DDL);
+            createSchema(stmt);
         } catch (SQLException e) {
             LOG.warnf("Failed to create RAG schema: %s", e.getMessage());
         }
     }
 
-    private Set<String> queryExistingSources(String jdbcUrl, String user, String password) {
-        Set<String> sources = new HashSet<>();
-        try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password);
-                Statement stmt = conn.createStatement()) {
-            // Table might not exist yet
-            stmt.execute(CREATE_EXTENSION_DDL);
-            stmt.execute(CREATE_TABLE_DDL);
-            try (ResultSet rs = stmt.executeQuery(
-                    "SELECT DISTINCT metadata->>'source' FROM " + RAG_DOCUMENTS_TABLE)) {
-                while (rs.next()) {
-                    String source = rs.getString(1);
-                    if (source != null) {
-                        sources.add(source);
-                    }
-                }
-            }
-            if (!sources.isEmpty()) {
-                LOG.infof("Container already has RAG data for %d source(s)", sources.size());
-            }
-        } catch (SQLException e) {
-            LOG.debugf("Failed to query existing RAG sources: %s", e.getMessage());
-        }
-        return sources;
+    private static void createSchema(Statement stmt) throws SQLException {
+        stmt.execute(CREATE_EXTENSION_DDL);
+        stmt.execute(CREATE_TABLE_DDL);
+        stmt.execute(CREATE_SOURCES_DDL);
     }
 
-    private void loadSql(String jdbcUrl, String user, String password,
-            List<RagFragment> fragments, String version) {
+    /**
+     * Reads the fingerprints recorded for each already-loaded source. A container
+     * populated before {@code rag_sources} existed reports nothing, so its data is
+     * treated as stale and reloaded once — the fragments replace their own rows.
+     */
+    Map<String, String> queryLoadedFingerprints(String jdbcUrl, String user, String password) {
+        Map<String, String> fingerprints = new HashMap<>();
+        try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password);
+                Statement stmt = conn.createStatement()) {
+            createSchema(stmt);
+            try (ResultSet rs = stmt.executeQuery("SELECT source, fingerprint FROM " + RAG_SOURCES_TABLE)) {
+                while (rs.next()) {
+                    fingerprints.put(rs.getString(1), rs.getString(2));
+                }
+            }
+            if (!fingerprints.isEmpty()) {
+                LOG.infof("Container already has RAG data for %d source(s)", fingerprints.size());
+            }
+        } catch (SQLException e) {
+            LOG.debugf("Failed to query loaded RAG fingerprints: %s", e.getMessage());
+        }
+        return fingerprints;
+    }
+
+    boolean loadSql(String jdbcUrl, String user, String password,
+            List<StaleFragment> fragments, String version) {
         LOG.infof("Loading %d RAG SQL fragment(s) for Quarkus %s...", fragments.size(), version);
 
         try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password)) {
             conn.setAutoCommit(false);
+            try {
+                try (Statement stmt = conn.createStatement()) {
+                    createSchema(stmt);
 
-            try (Statement stmt = conn.createStatement()) {
-                stmt.execute(CREATE_EXTENSION_DDL);
-                stmt.execute(CREATE_TABLE_DDL);
+                    for (StaleFragment stale : fragments) {
+                        RagFragment fragment = stale.fragment();
+                        Set<String> sources = fragmentSources(fragment);
 
-                for (RagFragment fragment : fragments) {
-                    if (fragment.streamJarPath() != null) {
-                        long count = streamFragmentIntoDb(stmt, fragment);
-                        LOG.debugf("Loaded RAG source: %s (%d statement(s), streamed)", fragment.source(), count);
-                    } else {
-                        for (String statement : splitSqlStatements(fragment.sql())) {
-                            if (!statement.isBlank()) {
-                                stmt.execute(statement);
+                        // Clear the fragment's own rows first. Its built-in DELETE only covers
+                        // the name it was generated under, which for an aggregated fragment is
+                        // not the per-row source, so rows the new content no longer replaces
+                        // would otherwise be left behind.
+                        deleteSources(conn, sources);
+
+                        if (fragment.streamJarPath() != null) {
+                            long count = streamFragmentIntoDb(stmt, fragment);
+                            LOG.debugf("Loaded RAG source: %s (%d statement(s), streamed)",
+                                    fragment.source(), count);
+                        } else {
+                            for (String statement : splitSqlStatements(fragment.sql())) {
+                                if (!statement.isBlank()) {
+                                    stmt.execute(statement);
+                                }
                             }
                         }
-                        LOG.debugf("Loaded RAG source: %s", fragment.source());
+
+                        recordSources(conn, sources, stale.fingerprint());
+                        LOG.debugf("Loaded RAG source: %s (%d source name(s))",
+                                fragment.source(), sources.size());
                     }
+
+                    stmt.execute(CREATE_INDEX_DDL);
                 }
 
-                stmt.execute(CREATE_INDEX_DDL);
+                conn.commit();
+            } catch (SQLException e) {
+                // Without this the connection closes mid-transaction and the rows deleted above
+                // are only restored by the driver's implicit rollback. Being explicit also means
+                // a failure to undo is logged rather than swallowed by close().
+                conn.rollback();
+                throw e;
             }
-
-            conn.commit();
 
             try (Statement stmt = conn.createStatement();
                     ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM " + RAG_DOCUMENTS_TABLE)) {
@@ -905,8 +1071,32 @@ public class RagSqlLoader {
                     LOG.infof("RAG data loaded: %d total documents for Quarkus %s", rs.getLong(1), version);
                 }
             }
+            return true;
         } catch (SQLException e) {
             LOG.errorf(e, "Failed to load RAG SQL for Quarkus %s", version);
+            return false;
+        }
+    }
+
+    private void deleteSources(Connection conn, Set<String> sources) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "DELETE FROM " + RAG_DOCUMENTS_TABLE + " WHERE metadata->>'source' = ANY(?)")) {
+            ps.setArray(1, conn.createArrayOf("text", sources.toArray()));
+            ps.executeUpdate();
+        }
+    }
+
+    private void recordSources(Connection conn, Set<String> sources, String fingerprint) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO " + RAG_SOURCES_TABLE + " (source, fingerprint, loaded_at) VALUES (?, ?, now()) "
+                        + "ON CONFLICT (source) DO UPDATE SET "
+                        + "fingerprint = EXCLUDED.fingerprint, loaded_at = now()")) {
+            for (String source : sources) {
+                ps.setString(1, source);
+                ps.setString(2, fingerprint);
+                ps.addBatch();
+            }
+            ps.executeBatch();
         }
     }
 

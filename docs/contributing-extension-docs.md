@@ -78,7 +78,7 @@ The MCP server searches for RAG SQL in this order:
 2. **Individual core extension JARs** — if no aggregated artifact is found, scans `~/.m2/repository/io/quarkus/quarkus-*-deployment/{version}/` for JARs containing `META-INF/quarkus-rag.sql`.
 3. **Non-core extension JARs** — always parses the project's `pom.xml` to find Quarkiverse and third-party dependencies, then checks their deployment JARs for `META-INF/quarkus-rag.sql`.
 
-Loading is incremental — when you add an extension to a project, the MCP server automatically discovers and loads its documentation without restarting. Each SQL fragment is identified by its source name, and only new sources are loaded.
+Loading is incremental — when you add an extension to a project, the MCP server automatically discovers and loads its documentation without restarting. Each SQL fragment is identified by its source name and fingerprinted by content in a `rag_sources` table, so a fragment that has been regenerated upstream is reloaded rather than skipped as already present. Reloading replaces the source's rows, so re-releasing your extension with updated docs is enough to refresh what the assistant sees.
 
 ## Verifying your contribution
 
