@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Set;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import org.junit.jupiter.api.Test;
@@ -87,6 +88,69 @@ class RagSqlLoaderTest {
                 jar.close();
             }
         };
+    }
+
+    @Test
+    void fingerprintChangesWhenFragmentContentChanges() {
+        String before = "INSERT INTO rag_documents ... '{\"source\":\"quarkus-rest\"}'::jsonb);";
+        String after = before + "\nINSERT INTO rag_documents ... more content;";
+
+        assertNotEquals(RagSqlLoader.fingerprint("3.21.0", before),
+                RagSqlLoader.fingerprint("3.21.0", after),
+                "A regenerated fragment must not look identical to the one already loaded");
+    }
+
+    @Test
+    void fingerprintChangesWhenQuarkusVersionChanges() {
+        String sql = "INSERT INTO rag_documents ... '{\"source\":\"quarkus-rest\"}'::jsonb);";
+
+        assertNotEquals(RagSqlLoader.fingerprint("3.21.0", sql),
+                RagSqlLoader.fingerprint("3.22.0", sql),
+                "The version is injected into row metadata, so it is part of the loaded content");
+    }
+
+    @Test
+    void fingerprintIsStableForIdenticalContent() {
+        String sql = "INSERT INTO rag_documents ... '{\"source\":\"quarkus-rest\"}'::jsonb);";
+
+        assertEquals(RagSqlLoader.fingerprint("3.21.0", sql), RagSqlLoader.fingerprint("3.21.0", sql));
+    }
+
+    @Test
+    void extractSourcesFindsEverySourceInAnAggregatedFragment() {
+        String sql = """
+                DELETE FROM rag_documents WHERE metadata->>'source' = 'quarkus-documentation';
+                INSERT INTO rag_documents (...) VALUES ('1', '[]'::vector, 'a', '{"source":"quarkus-rest"}'::jsonb);
+                INSERT INTO rag_documents (...) VALUES ('2', '[]'::vector, 'b', '{"source":"quarkus-arc"}'::jsonb);
+                INSERT INTO rag_documents (...) VALUES ('3', '[]'::vector, 'c', '{"source":"quarkus-rest"}'::jsonb);
+                """;
+
+        assertEquals(Set.of("quarkus-documentation", "quarkus-rest", "quarkus-arc"),
+                RagSqlLoader.extractSources(sql, "fallback"));
+    }
+
+    @Test
+    void extractSourcesIgnoresJsonQuotedInsideAGuidesOwnText() {
+        // Verbatim shape from the core docs artifact: a platform-descriptor example in
+        // quarkus-platform-bom. Treating it as a row source would make a reload delete rows
+        // for 'acme-platform', which is harmless only for as long as nothing owns that name.
+        String sql = """
+                INSERT INTO rag_documents (...) VALUES ('1', '[]'::vector, '"codestart-data" : {
+                  "quarkus-magic-codestart" : {
+                    "magic" : {
+                      "source" : "acme-platform"
+                    }
+                  }
+                }', '{"source":"quarkus-platform-bom","quarkus_version":"3.38.1"}'::jsonb);
+                """;
+
+        assertEquals(Set.of("quarkus-platform-bom"), RagSqlLoader.extractSources(sql, "fallback"));
+    }
+
+    @Test
+    void extractSourcesFallsBackWhenFragmentNamesNoSource() {
+        assertEquals(Set.of("quarkus-hibernate-orm"),
+                RagSqlLoader.extractSources("INSERT INTO rag_documents VALUES (1);", "quarkus-hibernate-orm"));
     }
 
     @Test

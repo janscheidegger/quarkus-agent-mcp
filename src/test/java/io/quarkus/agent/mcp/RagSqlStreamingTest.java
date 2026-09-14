@@ -9,12 +9,14 @@ import java.io.StringReader;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 /**
- * The streaming path reimplements two things that already existed for the in-memory path:
- * finding a fragment's source, and splitting SQL into statements. Both have to agree with
- * the originals, because fragments take one path or the other depending only on their size.
+ * The streaming path reimplements three things that already existed for the in-memory path:
+ * finding a fragment's source, collecting every source it writes, and splitting SQL into
+ * statements. All three have to agree with the originals: which path a fragment takes is
+ * decided by where it came from, not by anything the rest of the loader can see.
  */
 class RagSqlStreamingTest {
 
@@ -135,5 +137,33 @@ class RagSqlStreamingTest {
     @Test
     void streamSplitMatchesOnTheAggregatedArtifactShape() throws Exception {
         assertEquals(RagSqlLoader.splitSqlStatements(AGGREGATED_HEAD), streamSplit(AGGREGATED_HEAD));
+    }
+
+    // ── streamSources agrees with extractSources ────────────────────────────────
+
+    private static Set<String> streamSources(String sql, String fallback) throws IOException {
+        return RagSqlLoader.streamSources(new BufferedReader(new StringReader(sql)), fallback);
+    }
+
+    @Test
+    void streamSourcesFindsEverySourceTheFragmentWrites() throws IOException {
+        // Deciding what to clear before a reload needs all of them, not just the peeked one
+        assertEquals(RagSqlLoader.extractSources(AGGREGATED_HEAD, "fallback"),
+                streamSources(AGGREGATED_HEAD, "fallback"));
+    }
+
+    @Test
+    void streamSourcesFallsBackWhenTheFragmentNamesNoSource() throws IOException {
+        String sql = "INSERT INTO rag_documents VALUES (1);\n";
+
+        assertEquals(RagSqlLoader.extractSources(sql, "quarkus-hibernate-orm"),
+                streamSources(sql, "quarkus-hibernate-orm"));
+    }
+
+    @Test
+    void streamSourcesKeepsTheDeleteNameAlongsideTheRowSources() throws IOException {
+        // Unlike peekSource, which picks one, a reload has to clear every name the
+        // fragment touches, including the one its own DELETE was generated under
+        assertTrue(streamSources(AGGREGATED_HEAD, "fallback").contains("quarkus-documentation"));
     }
 }
