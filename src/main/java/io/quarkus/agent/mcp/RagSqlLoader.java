@@ -592,22 +592,10 @@ public class RagSqlLoader {
             if (entry == null) {
                 return null;
             }
-            String source = fallbackSource;
+            String source;
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(jar.getInputStream(entry), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    Matcher rowMatcher = ROW_SOURCE_PATTERN.matcher(line);
-                    if (rowMatcher.find()) {
-                        source = rowMatcher.group(1);
-                        break;
-                    }
-                    Matcher m = SOURCE_PATTERN.matcher(line);
-                    if (m.find()) {
-                        source = m.group(1);
-                        break;
-                    }
-                }
+                source = peekSource(reader, fallbackSource);
             }
             return new RagFragment(source, null, jarPath);
         } catch (IOException e) {
@@ -616,8 +604,37 @@ public class RagSqlLoader {
         }
     }
 
+    /**
+     * Streaming equivalent of {@link #extractSource(String, String)}, and it must agree with it:
+     * the fragment's source is how {@code ensureLoaded} decides whether the fragment is already
+     * in the database, and that check compares against {@code metadata->>'source'} values of rows
+     * actually present. A row source therefore wins over the name in the leading DELETE, which for
+     * the aggregated core artifact is {@code quarkus-documentation} and matches no row at all.
+     * Returning the DELETE name would make the fragment look permanently absent and re-execute it
+     * on every restart against a reused container, colliding on the baked-in embedding_id keys.
+     * <p>
+     * Reading stops at the first row source, so in practice this consumes a handful of lines.
+     */
+    static String peekSource(BufferedReader reader, String fallbackSource) throws IOException {
+        String deleteSource = null;
+        String line;
+        while ((line = reader.readLine()) != null) {
+            Matcher rowMatcher = ROW_SOURCE_PATTERN.matcher(line);
+            if (rowMatcher.find()) {
+                return rowMatcher.group(1);
+            }
+            if (deleteSource == null) {
+                Matcher deleteMatcher = SOURCE_PATTERN.matcher(line);
+                if (deleteMatcher.find()) {
+                    deleteSource = deleteMatcher.group(1);
+                }
+            }
+        }
+        return deleteSource != null ? deleteSource : fallbackSource;
+    }
+
     @FunctionalInterface
-    private interface SqlStatementSink {
+    interface SqlStatementSink {
         void accept(String statement) throws SQLException;
     }
 
@@ -688,7 +705,7 @@ public class RagSqlLoader {
      * statement, so memory usage is bounded by the largest individual statement rather than
      * the size of the whole input.
      */
-    private static void streamSplitAndConsume(PushbackReader reader, SqlStatementSink sink)
+    static void streamSplitAndConsume(PushbackReader reader, SqlStatementSink sink)
             throws IOException, SQLException {
         StringBuilder current = new StringBuilder();
         boolean inSingleQuote = false;
