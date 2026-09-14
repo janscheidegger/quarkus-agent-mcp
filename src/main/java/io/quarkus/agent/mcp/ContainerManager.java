@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 import org.testcontainers.DockerClientFactory;
@@ -61,8 +62,17 @@ public class ContainerManager {
     private final Set<String> ragSqlVersions = ConcurrentHashMap.newKeySet();
     private volatile Boolean dockerAvailable;
     private volatile boolean defaultWarmupStarted;
-    private volatile boolean defaultWarmupDone;
-    private volatile String defaultWarmupError;
+
+    /**
+     * Terminal outcome of the background warm-up, or null while it is still running.
+     *
+     * @param error the failure message, or null if the warm-up succeeded
+     */
+    private record WarmupOutcome(String error) {
+        static final WarmupOutcome SUCCESS = new WarmupOutcome(null);
+    }
+
+    private final AtomicReference<WarmupOutcome> defaultWarmupOutcome = new AtomicReference<>();
 
     /**
      * Starts the default container in a background thread so the first searchDocs
@@ -73,6 +83,9 @@ public class ContainerManager {
      * up" forever when a slow/unreachable dependency lookup (e.g. Maven artifact resolution over
      * a restricted network) blocks the pipeline. Check the agent-mcp log for per-step timing —
      * look for "RAG scan" and "Maven dependency" entries to see exactly which lookup was stuck.
+     * <p>
+     * The interrupt is best-effort, so a timed-out warm-up may still complete afterwards; if it
+     * does, the success replaces the recorded timeout and the server reports itself ready.
      */
     public void warmUpDefaultAsync() {
         if (defaultWarmupStarted) {
@@ -83,17 +96,16 @@ public class ContainerManager {
         Thread worker = Thread.ofVirtual().name("container-warmup").unstarted(() -> {
             try {
                 ensureRunning(null, null);
-                defaultWarmupDone = true;
+                recordWarmupSuccess();
                 LOG.infof("Documentation search is ready (%d ms)", System.currentTimeMillis() - warmupStart);
             } catch (Throwable e) {
                 // Catch Throwable, not just Exception: an uncaught Error (e.g. NoClassDefFoundError,
                 // ExceptionInInitializerError) would otherwise kill this thread silently without ever
-                // setting defaultWarmupDone, leaving isReady()/isFailed() both false forever and
-                // searchDocs stuck reporting "still warming up" indefinitely with no diagnostic trace.
+                // recording an outcome, leaving isDefaultReady()/isDefaultWarmupDone() both false
+                // forever and searchDocs stuck reporting "still warming up" with no diagnostic trace.
                 LOG.error("Background container warm-up failed after "
                         + (System.currentTimeMillis() - warmupStart) + " ms", e);
-                defaultWarmupError = e.getClass().getSimpleName() + ": " + e.getMessage();
-                defaultWarmupDone = true;
+                recordWarmupFailure(e.getClass().getSimpleName() + ": " + e.getMessage());
             }
         });
         worker.start();
@@ -105,8 +117,11 @@ public class ContainerManager {
                 Thread.currentThread().interrupt();
                 return;
             }
-            if (!defaultWarmupDone) {
-                long elapsed = System.currentTimeMillis() - warmupStart;
+            long elapsed = System.currentTimeMillis() - warmupStart;
+            boolean timedOut = recordWarmupFailure("Warm-up timed out after " + elapsed + " ms. "
+                    + "See the agent-mcp log for the last 'RAG scan' or 'Maven dependency' entry to "
+                    + "identify which dependency lookup was stuck.");
+            if (timedOut) {
                 LOG.warnf(
                         "Documentation search warm-up exceeded %d ms (elapsed %d ms) — aborting. "
                                 + "Check the agent-mcp log for 'RAG scan' / 'Maven dependency' entries above "
@@ -114,24 +129,43 @@ public class ContainerManager {
                                 + "a documentation artifact for a project dependency).",
                         warmupTimeoutMillis, elapsed);
                 worker.interrupt();
-                defaultWarmupError = "Warm-up timed out after " + elapsed + " ms. "
-                        + "See the agent-mcp log for the last 'RAG scan' or 'Maven dependency' entry to "
-                        + "identify which dependency lookup was stuck.";
-                defaultWarmupDone = true;
             }
         });
     }
 
+    /**
+     * Records warm-up success, overwriting any failure already recorded. Interrupting a virtual
+     * thread parked in JDBC or jar IO does not reliably stop it, so the worker can still finish
+     * after the watchdog gave up on it. When that happens the container really is usable, and
+     * that fact has to win over the watchdog's guess — otherwise the server reports a stale
+     * timeout forever over a working database.
+     */
+    void recordWarmupSuccess() {
+        defaultWarmupOutcome.set(WarmupOutcome.SUCCESS);
+    }
+
+    /**
+     * Records a warm-up failure unless an outcome was already recorded, so that the first
+     * failure reported wins and a late failure cannot mask an earlier, more specific one.
+     *
+     * @return true if this call is the one that recorded the outcome
+     */
+    boolean recordWarmupFailure(String error) {
+        return defaultWarmupOutcome.compareAndSet(null, new WarmupOutcome(error));
+    }
+
     public boolean isDefaultReady() {
-        return defaultWarmupDone && defaultWarmupError == null;
+        WarmupOutcome outcome = defaultWarmupOutcome.get();
+        return outcome != null && outcome.error() == null;
     }
 
     public boolean isDefaultWarmupDone() {
-        return defaultWarmupDone;
+        return defaultWarmupOutcome.get() != null;
     }
 
     public String getDefaultWarmupError() {
-        return defaultWarmupError;
+        WarmupOutcome outcome = defaultWarmupOutcome.get();
+        return outcome == null ? null : outcome.error();
     }
 
     /**

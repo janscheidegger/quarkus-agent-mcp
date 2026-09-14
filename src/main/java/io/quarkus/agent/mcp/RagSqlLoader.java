@@ -29,6 +29,7 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
@@ -47,6 +48,17 @@ public class RagSqlLoader {
 
     @Inject
     WebClient webClient;
+
+    /**
+     * Hard budget for the per-dependency part of the non-core extension RAG scan. Individual
+     * network/process fallbacks (HTTP download, {@code mvn dependency:get}) each carry their own
+     * timeout, but on projects with many dependencies those add up to a long stall with no visible
+     * progress. Once the budget is exceeded we stop attempting <em>new</em> network/process lookups
+     * and finish the pass using only what is already available locally, so callers get a (possibly
+     * partial) result in bounded time instead of hanging indefinitely.
+     */
+    @ConfigProperty(name = "agent-mcp.doc-search.non-core-scan-budget-millis", defaultValue = "120000")
+    long nonCoreScanBudgetMillis;
 
     private static final String RAG_SQL_PATH = "META-INF/quarkus-rag.sql";
     private static final String RAG_DATA_SQL_PATH = "META-INF/quarkus-rag-data.sql";
@@ -177,27 +189,25 @@ public class RagSqlLoader {
         return fragments;
     }
 
-    // Hard budget for the whole non-core extension RAG scan. Individual network/process
-    // fallbacks (HTTP download, `mvn dependency:get`) each carry their own timeout, but on
-    // projects with many dependencies those can add up to a very long stall with no visible
-    // progress. Once the budget is exceeded we stop attempting *new* network/process lookups
-    // and finish the pass using only what's already available locally, so callers get a
-    // (possibly partial) result in bounded time instead of hanging indefinitely.
-    private static final long NON_CORE_SCAN_BUDGET_MILLIS = Long.getLong(
-            "agent-mcp.doc-search.non-core-scan-budget-millis", 120_000L);
-
     private List<RagFragment> scanNonCoreExtensionJars(Path m2Repo, String projectDir, String quarkusVersion) {
         if (projectDir == null) {
             return List.of();
         }
 
-        long scanStart = System.currentTimeMillis();
+        long resolveStart = System.currentTimeMillis();
         List<DependencyResolver.Dependency> deps = DependencyResolver.resolve(projectDir);
         LOG.infof("RAG scan: resolved %d dependencies for %s in %d ms", deps.size(), projectDir,
-                System.currentTimeMillis() - scanStart);
+                System.currentTimeMillis() - resolveStart);
         if (deps.isEmpty()) {
             return List.of();
         }
+
+        // The budget clock starts here, after dependency resolution, not at method entry.
+        // Resolution shells out to Maven whenever the pom leaves versions to a BOM -- the norm
+        // for a Quarkus project -- and carries its own 180s timeout, which on its own exceeds
+        // the default budget. Timing from method entry would therefore skip every lookup below
+        // before the first iteration, on exactly the slow-network setups the budget is for.
+        long scanStart = System.currentTimeMillis();
 
         List<RagFragment> fragments = new ArrayList<>();
         int index = 0;
@@ -208,7 +218,7 @@ public class RagSqlLoader {
                 continue;
             }
             long elapsedSoFar = System.currentTimeMillis() - scanStart;
-            boolean budgetExceeded = elapsedSoFar > NON_CORE_SCAN_BUDGET_MILLIS;
+            boolean budgetExceeded = elapsedSoFar > nonCoreScanBudgetMillis;
 
             String groupPath = dep.groupId().replace('.', '/');
             Path deploymentJar = m2Repo.resolve(groupPath)
@@ -231,7 +241,7 @@ public class RagSqlLoader {
                             "RAG scan [%d/%d] %s:%s — skipping remote RAG artifact lookup (%s:%s), "
                                     + "%d ms scan budget exceeded (elapsed %d ms)",
                             index, deps.size(), dep.groupId(), dep.artifactId(),
-                            pointer.groupId(), pointer.artifactId(), NON_CORE_SCAN_BUDGET_MILLIS, elapsedSoFar);
+                            pointer.groupId(), pointer.artifactId(), nonCoreScanBudgetMillis, elapsedSoFar);
                     continue;
                 }
                 long depStart = System.currentTimeMillis();
