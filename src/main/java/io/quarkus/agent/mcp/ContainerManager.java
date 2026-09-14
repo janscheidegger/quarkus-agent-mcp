@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 import org.testcontainers.DockerClientFactory;
@@ -53,46 +54,118 @@ public class ContainerManager {
     @Inject
     RagSqlLoader ragSqlLoader;
 
+    @ConfigProperty(name = "agent-mcp.doc-search.warmup-timeout-millis", defaultValue = "300000")
+    long warmupTimeoutMillis;
+
     private final ConcurrentHashMap<String, GenericContainer<?>> containers = new ConcurrentHashMap<>();
     private final Set<String> fallbackVersions = ConcurrentHashMap.newKeySet();
     private final Set<String> ragSqlVersions = ConcurrentHashMap.newKeySet();
     private volatile Boolean dockerAvailable;
     private volatile boolean defaultWarmupStarted;
-    private volatile boolean defaultWarmupDone;
-    private volatile String defaultWarmupError;
+
+    /**
+     * Terminal outcome of the background warm-up, or null while it is still running.
+     *
+     * @param error the failure message, or null if the warm-up succeeded
+     */
+    private record WarmupOutcome(String error) {
+        static final WarmupOutcome SUCCESS = new WarmupOutcome(null);
+    }
+
+    private final AtomicReference<WarmupOutcome> defaultWarmupOutcome = new AtomicReference<>();
 
     /**
      * Starts the default container in a background thread so the first searchDocs
      * call doesn't block for container startup.
+     * <p>
+     * A watchdog thread interrupts the warm-up after {@code warmupTimeoutMillis} (default 5
+     * minutes) if it hasn't finished, so callers get a clear failure instead of "still warming
+     * up" forever when a slow/unreachable dependency lookup (e.g. Maven artifact resolution over
+     * a restricted network) blocks the pipeline. Check the agent-mcp log for per-step timing —
+     * look for "RAG scan" and "Maven dependency" entries to see exactly which lookup was stuck.
+     * <p>
+     * The interrupt is best-effort, so a timed-out warm-up may still complete afterwards; if it
+     * does, the success replaces the recorded timeout and the server reports itself ready.
      */
     public void warmUpDefaultAsync() {
         if (defaultWarmupStarted) {
             return;
         }
         defaultWarmupStarted = true;
-        Thread.ofVirtual().name("container-warmup").start(() -> {
+        long warmupStart = System.currentTimeMillis();
+        Thread worker = Thread.ofVirtual().name("container-warmup").unstarted(() -> {
             try {
                 ensureRunning(null, null);
-                defaultWarmupDone = true;
-                LOG.info("Documentation search is ready");
-            } catch (Exception e) {
-                LOG.warn("Background container warm-up failed: " + e.getMessage());
-                defaultWarmupError = e.getMessage();
-                defaultWarmupDone = true;
+                recordWarmupSuccess();
+                LOG.infof("Documentation search is ready (%d ms)", System.currentTimeMillis() - warmupStart);
+            } catch (Throwable e) {
+                // Catch Throwable, not just Exception: an uncaught Error (e.g. NoClassDefFoundError,
+                // ExceptionInInitializerError) would otherwise kill this thread silently without ever
+                // recording an outcome, leaving isDefaultReady()/isDefaultWarmupDone() both false
+                // forever and searchDocs stuck reporting "still warming up" with no diagnostic trace.
+                LOG.error("Background container warm-up failed after "
+                        + (System.currentTimeMillis() - warmupStart) + " ms", e);
+                recordWarmupFailure(e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+        });
+        worker.start();
+
+        Thread.ofPlatform().daemon(true).name("container-warmup-watchdog").start(() -> {
+            try {
+                worker.join(warmupTimeoutMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            long elapsed = System.currentTimeMillis() - warmupStart;
+            boolean timedOut = recordWarmupFailure("Warm-up timed out after " + elapsed + " ms. "
+                    + "See the agent-mcp log for the last 'RAG scan' or 'Maven dependency' entry to "
+                    + "identify which dependency lookup was stuck.");
+            if (timedOut) {
+                LOG.warnf(
+                        "Documentation search warm-up exceeded %d ms (elapsed %d ms) — aborting. "
+                                + "Check the agent-mcp log for 'RAG scan' / 'Maven dependency' entries above "
+                                + "to see which lookup was stuck (often a slow/blocked network call to resolve "
+                                + "a documentation artifact for a project dependency).",
+                        warmupTimeoutMillis, elapsed);
+                worker.interrupt();
             }
         });
     }
 
+    /**
+     * Records warm-up success, overwriting any failure already recorded. Interrupting a virtual
+     * thread parked in JDBC or jar IO does not reliably stop it, so the worker can still finish
+     * after the watchdog gave up on it. When that happens the container really is usable, and
+     * that fact has to win over the watchdog's guess — otherwise the server reports a stale
+     * timeout forever over a working database.
+     */
+    void recordWarmupSuccess() {
+        defaultWarmupOutcome.set(WarmupOutcome.SUCCESS);
+    }
+
+    /**
+     * Records a warm-up failure unless an outcome was already recorded, so that the first
+     * failure reported wins and a late failure cannot mask an earlier, more specific one.
+     *
+     * @return true if this call is the one that recorded the outcome
+     */
+    boolean recordWarmupFailure(String error) {
+        return defaultWarmupOutcome.compareAndSet(null, new WarmupOutcome(error));
+    }
+
     public boolean isDefaultReady() {
-        return defaultWarmupDone && defaultWarmupError == null;
+        WarmupOutcome outcome = defaultWarmupOutcome.get();
+        return outcome != null && outcome.error() == null;
     }
 
     public boolean isDefaultWarmupDone() {
-        return defaultWarmupDone;
+        return defaultWarmupOutcome.get() != null;
     }
 
     public String getDefaultWarmupError() {
-        return defaultWarmupError;
+        WarmupOutcome outcome = defaultWarmupOutcome.get();
+        return outcome == null ? null : outcome.error();
     }
 
     /**
@@ -331,10 +404,14 @@ public class ContainerManager {
 
     private void loadRagData(String versionKey, String quarkusVersion, String projectDir) {
         GenericContainer<?> container = containers.get(versionKey);
+        LOG.infof("Loading RAG data for Quarkus %s (project=%s)...", versionKey, projectDir);
+        long start = System.currentTimeMillis();
         ragSqlLoader.ensureLoaded(
                 quarkusVersion, projectDir,
                 container.getHost(), container.getMappedPort(5432),
                 pgDatabase, pgUser, pgPassword);
+        LOG.infof("Finished loading RAG data for Quarkus %s in %d ms", versionKey,
+                System.currentTimeMillis() - start);
     }
 
     private void loadNonCoreRagData(String versionKey, String quarkusVersion, String projectDir) {
