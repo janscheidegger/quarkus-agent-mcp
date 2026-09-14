@@ -3,9 +3,12 @@ package io.quarkus.agent.mcp;
 import io.vertx.mutiny.ext.web.client.WebClient;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.PushbackReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -85,8 +88,21 @@ public class RagSqlLoader {
     private static final Pattern SOURCE_PATTERN = Pattern.compile(
             "metadata\\s*->>\\s*'source'\\s*=\\s*'([^']+)'");
     private static final Pattern ROW_SOURCE_PATTERN = Pattern.compile("\"source\"\\s*:\\s*\"([^\"]+)\"");
+    private static final Pattern EXTENSION_FROM_SOURCE_PATTERN = Pattern.compile(
+            "'\\{\"source\":\"([^\"]+)\"");
+    private static final String VERSION_KEY = ",\"version\":";
+    private static final String QUARKUS_VERSION_KEY = ",\"quarkus_version\":";
 
-    record RagFragment(String source, String sql) {
+    /**
+     * @param sql            in-memory SQL content, or {@code null} when {@code streamJarPath} is set
+     * @param streamJarPath  when non-null, the fragment's SQL must be streamed line-by-line from the
+     *                       {@code META-INF/quarkus-rag(-data).sql} entry of this jar rather than read
+     *                       into memory (used for the large aggregated core-docs artifact)
+     */
+    record RagFragment(String source, String sql, Path streamJarPath) {
+        RagFragment(String source, String sql) {
+            this(source, sql, null);
+        }
     }
 
     record RagArtifactPointer(String groupId, String artifactId) {
@@ -160,18 +176,23 @@ public class RagSqlLoader {
         List<RagFragment> fragments = new ArrayList<>();
 
         // 1. Core docs: aggregated artifact (preferred) or individual JARs (fallback)
+        // The aggregated artifact can be tens of MB (e.g. ~47MB for the current Quarkus
+        // documentation artifact, one JSON/vector row per line). We only "peek" the source
+        // name here (cheap: reads a handful of lines) and defer the actual content to a
+        // streaming fragment that is read/transformed/executed line-by-line in loadSql(),
+        // instead of ever materializing the whole file as one in-memory String.
         Path aggregatedJarPath = resolveAggregatedJarPath(quarkusVersion, m2Repo);
-        RagFragment aggregated = readFragmentFromJar(aggregatedJarPath, "quarkus-documentation");
+        RagFragment aggregated = peekStreamedFragment(aggregatedJarPath, "quarkus-documentation");
         if (aggregated != null) {
-            fragments.add(injectExtensionFromSource(aggregated));
+            fragments.add(aggregated);
             LOG.infof("Found aggregated RAG SQL artifact locally for Quarkus %s", quarkusVersion);
         } else {
             // Try downloading from Maven Central
             Path downloaded = downloadFromMavenCentral(quarkusVersion, aggregatedJarPath);
             if (downloaded != null) {
-                aggregated = readFragmentFromJar(downloaded, "quarkus-documentation");
+                aggregated = peekStreamedFragment(downloaded, "quarkus-documentation");
                 if (aggregated != null) {
-                    fragments.add(injectExtensionFromSource(aggregated));
+                    fragments.add(aggregated);
                     LOG.infof("Downloaded aggregated RAG SQL artifact for Quarkus %s", quarkusVersion);
                 }
             }
@@ -458,12 +479,41 @@ public class RagSqlLoader {
     }
 
     private RagFragment injectExtensionFromSource(RagFragment fragment) {
-        String enriched = fragment.sql().replaceAll(
-                "'\\{\"source\":\"([^\"]+)\"",
-                "'{\"extension\":\"$1\",\"source\":\"$1\"");
-        // Handle new plugin format: rename generic "version" to "quarkus_version" for core extensions
-        enriched = enriched.replace(",\"version\":", ",\"quarkus_version\":");
-        return new RagFragment(fragment.source(), enriched);
+        // Single-pass transform instead of two chained String.replaceAll()/replace() calls.
+        // The aggregated core-docs SQL fragment can be tens of MB (e.g. ~47MB for the current
+        // Quarkus documentation artifact); doing two full-string regex/replace passes each
+        // materializes a fresh copy of the whole string, which can spike memory well past a
+        // constrained heap (observed to OOM with -Xmx512m). Here we scan once and copy each
+        // "between match" chunk straight into a pre-sized StringBuilder, applying the literal
+        // ",\"version\":" -> ",\"quarkus_version\":" fix-up per chunk instead of on the whole
+        // string, so peak memory stays close to ~1x the input size rather than ~3-4x.
+        String sql = fragment.sql();
+        Matcher matcher = EXTENSION_FROM_SOURCE_PATTERN.matcher(sql);
+        StringBuilder result = new StringBuilder(sql.length() + 64);
+        int lastEnd = 0;
+        while (matcher.find()) {
+            appendWithVersionKeyFix(result, sql, lastEnd, matcher.start());
+            String source = matcher.group(1);
+            result.append("'{\"extension\":\"").append(source).append("\",\"source\":\"").append(source).append('"');
+            lastEnd = matcher.end();
+        }
+        appendWithVersionKeyFix(result, sql, lastEnd, sql.length());
+        return new RagFragment(fragment.source(), result.toString());
+    }
+
+    /**
+     * Appends sql[from, to) to result, rewriting the generic "version" JSON key to
+     * "quarkus_version" for core extensions, without allocating an intermediate copy
+     * of the (potentially very large) full string.
+     */
+    private static void appendWithVersionKeyFix(StringBuilder result, String sql, int from, int to) {
+        int searchFrom = from;
+        int idx;
+        while ((idx = sql.indexOf(VERSION_KEY, searchFrom)) != -1 && idx < to) {
+            result.append(sql, searchFrom, idx).append(QUARKUS_VERSION_KEY);
+            searchFrom = idx + VERSION_KEY.length();
+        }
+        result.append(sql, searchFrom, to);
     }
 
     private Path resolveAggregatedJarPath(String version, Path m2Repo) {
@@ -591,6 +641,199 @@ public class RagSqlLoader {
         return fallbackSource;
     }
 
+    /**
+     * Like {@link #readFragmentFromJar}, but never materializes the (potentially very large)
+     * SQL content in memory: it only reads far enough to determine the fragment's {@code source}
+     * name (a handful of lines, in practice), and returns a fragment that streams its actual
+     * content later, directly from the jar, in {@link #streamFragmentIntoDb}.
+     */
+    private RagFragment peekStreamedFragment(Path jarPath, String fallbackSource) {
+        if (!Files.isRegularFile(jarPath)) {
+            return null;
+        }
+        try (JarFile jar = new JarFile(jarPath.toFile())) {
+            JarEntry entry = jar.getJarEntry(RAG_DATA_SQL_PATH);
+            if (entry == null) {
+                entry = jar.getJarEntry(RAG_SQL_PATH);
+            }
+            if (entry == null) {
+                return null;
+            }
+            String source;
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(jar.getInputStream(entry), StandardCharsets.UTF_8))) {
+                source = peekSource(reader, fallbackSource);
+            }
+            return new RagFragment(source, null, jarPath);
+        } catch (IOException e) {
+            LOG.debugf("Failed to peek RAG SQL source from %s: %s", jarPath, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Streaming equivalent of {@link #extractSource(String, String)}, and it must agree with it:
+     * the fragment's source is how {@code ensureLoaded} decides whether the fragment is already
+     * in the database, and that check compares against {@code metadata->>'source'} values of rows
+     * actually present. A row source therefore wins over the name in the leading DELETE, which for
+     * the aggregated core artifact is {@code quarkus-documentation} and matches no row at all.
+     * Returning the DELETE name would make the fragment look permanently absent and re-execute it
+     * on every restart against a reused container, colliding on the baked-in embedding_id keys.
+     * <p>
+     * Reading stops at the first row source, so in practice this consumes a handful of lines.
+     */
+    static String peekSource(BufferedReader reader, String fallbackSource) throws IOException {
+        String deleteSource = null;
+        String line;
+        while ((line = reader.readLine()) != null) {
+            Matcher rowMatcher = ROW_SOURCE_PATTERN.matcher(line);
+            if (rowMatcher.find()) {
+                return rowMatcher.group(1);
+            }
+            if (deleteSource == null) {
+                Matcher deleteMatcher = SOURCE_PATTERN.matcher(line);
+                if (deleteMatcher.find()) {
+                    deleteSource = deleteMatcher.group(1);
+                }
+            }
+        }
+        return deleteSource != null ? deleteSource : fallbackSource;
+    }
+
+    @FunctionalInterface
+    interface SqlStatementSink {
+        void accept(String statement) throws SQLException;
+    }
+
+    /**
+     * Reads a {@code fragment.streamJarPath()}'s {@code META-INF/quarkus-rag(-data).sql} entry
+     * and executes each statement directly against the database as it is parsed, transforming
+     * one (small) statement at a time instead of the whole file. This keeps peak memory usage
+     * proportional to a single row (a few KB) rather than the size of the whole aggregated
+     * artifact (tens of MB), which previously caused OutOfMemoryError with a constrained heap.
+     */
+    private long streamFragmentIntoDb(Statement stmt, RagFragment fragment) throws SQLException {
+        Path jarPath = fragment.streamJarPath();
+        long[] count = { 0 };
+        try (JarFile jar = new JarFile(jarPath.toFile())) {
+            JarEntry entry = jar.getJarEntry(RAG_DATA_SQL_PATH);
+            if (entry == null) {
+                entry = jar.getJarEntry(RAG_SQL_PATH);
+            }
+            if (entry == null) {
+                LOG.warnf("RAG SQL entry not found for streamed fragment %s", fragment.source());
+                return 0;
+            }
+            try (PushbackReader reader = new PushbackReader(
+                    new BufferedReader(new InputStreamReader(jar.getInputStream(entry), StandardCharsets.UTF_8),
+                            1 << 16),
+                    1)) {
+                streamSplitAndConsume(reader, statement -> {
+                    stmt.execute(transformStatement(statement));
+                    count[0]++;
+                });
+            }
+        } catch (IOException e) {
+            throw new SQLException("Failed to stream RAG SQL from " + jarPath, e);
+        }
+        return count[0];
+    }
+
+    /**
+     * Applies the same two transforms as {@link #injectExtensionFromSource} (inject an
+     * "extension" JSON key derived from "source", and rename "version" to "quarkus_version"),
+     * but to a single (small) SQL statement rather than to a whole multi-MB file.
+     */
+    private static String transformStatement(String statement) {
+        Matcher matcher = EXTENSION_FROM_SOURCE_PATTERN.matcher(statement);
+        String withExtension;
+        if (matcher.find()) {
+            StringBuilder sb = new StringBuilder(statement.length() + 64);
+            int lastEnd = 0;
+            matcher.reset();
+            while (matcher.find()) {
+                sb.append(statement, lastEnd, matcher.start());
+                String source = matcher.group(1);
+                sb.append("'{\"extension\":\"").append(source).append("\",\"source\":\"").append(source).append('"');
+                lastEnd = matcher.end();
+            }
+            sb.append(statement, lastEnd, statement.length());
+            withExtension = sb.toString();
+        } else {
+            withExtension = statement;
+        }
+        return withExtension.replace(VERSION_KEY, QUARKUS_VERSION_KEY);
+    }
+
+    /**
+     * Streaming equivalent of {@link #splitSqlStatements(String)}: reads one character at a
+     * time from {@code reader} instead of from an in-memory String, invoking {@code sink} with
+     * each statement as soon as it's complete. The rolling buffer only ever holds a single
+     * statement, so memory usage is bounded by the largest individual statement rather than
+     * the size of the whole input.
+     */
+    static void streamSplitAndConsume(PushbackReader reader, SqlStatementSink sink)
+            throws IOException, SQLException {
+        StringBuilder current = new StringBuilder();
+        boolean inSingleQuote = false;
+        boolean inLineComment = false;
+        int ic;
+
+        while ((ic = reader.read()) != -1) {
+            char c = (char) ic;
+
+            if (c == '\n') {
+                inLineComment = false;
+                current.append(c);
+                continue;
+            }
+
+            if (inLineComment) {
+                continue;
+            }
+
+            if (c == '-' && !inSingleQuote) {
+                int next = reader.read();
+                if (next == '-') {
+                    inLineComment = true;
+                    continue;
+                }
+                if (next != -1) {
+                    reader.unread(next);
+                }
+            }
+
+            if (c == '\'') {
+                if (inSingleQuote) {
+                    int next = reader.read();
+                    if (next == '\'') {
+                        current.append('\'').append('\'');
+                        continue;
+                    }
+                    if (next != -1) {
+                        reader.unread(next);
+                    }
+                }
+                inSingleQuote = !inSingleQuote;
+            }
+
+            if (c == ';' && !inSingleQuote) {
+                String stmt = current.toString().trim();
+                if (!stmt.isEmpty()) {
+                    sink.accept(stmt);
+                }
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+
+        String remaining = current.toString().trim();
+        if (!remaining.isEmpty()) {
+            sink.accept(remaining);
+        }
+    }
+
     private void ensureSchema(String jdbcUrl, String user, String password) {
         try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password);
                 Statement stmt = conn.createStatement()) {
@@ -638,12 +881,17 @@ public class RagSqlLoader {
                 stmt.execute(CREATE_TABLE_DDL);
 
                 for (RagFragment fragment : fragments) {
-                    for (String statement : splitSqlStatements(fragment.sql())) {
-                        if (!statement.isBlank()) {
-                            stmt.execute(statement);
+                    if (fragment.streamJarPath() != null) {
+                        long count = streamFragmentIntoDb(stmt, fragment);
+                        LOG.debugf("Loaded RAG source: %s (%d statement(s), streamed)", fragment.source(), count);
+                    } else {
+                        for (String statement : splitSqlStatements(fragment.sql())) {
+                            if (!statement.isBlank()) {
+                                stmt.execute(statement);
+                            }
                         }
+                        LOG.debugf("Loaded RAG source: %s", fragment.source());
                     }
-                    LOG.debugf("Loaded RAG source: %s", fragment.source());
                 }
 
                 stmt.execute(CREATE_INDEX_DDL);
